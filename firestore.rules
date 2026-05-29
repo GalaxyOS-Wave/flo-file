@@ -1,0 +1,112 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // 1. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isSandboxOwner(ownerId) {
+      return ownerId is string && ownerId.matches('^sb-.*');
+    }
+
+    // Allow sandbox owner IDs (starting with sb-) regardless of exact auth status during transient logins
+    function isOwnerOrSandbox(ownerId) {
+      return (request.auth != null && request.auth.uid == ownerId) ||
+             (ownerId is string && ownerId.matches('^sb-.*'));
+    }
+
+    function isOwner(data) {
+      return data != null && (
+        (request.auth != null && 'owner_id' in data && data.owner_id == request.auth.uid) ||
+        ('owner_id' in data && data.owner_id is string && data.owner_id.matches('^sb-.*'))
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Project Validation Blueprint
+    function isValidProject(data) {
+      return data.keys().hasAll(['id', 'owner_id', 'client_name', 'project_name', 'amount_due', 'is_paid', 'created_at', 'milestones'])
+        && data.keys().size() <= 16
+        && data.id is string && data.id.size() <= 128
+        && data.owner_id is string && data.owner_id.size() <= 128
+        && data.client_name is string && data.client_name.size() <= 256
+        && data.project_name is string && data.project_name.size() <= 256
+        && data.amount_due is number && data.amount_due >= 0
+        && data.is_paid is bool
+        && data.created_at is string && data.created_at.size() <= 64
+        && data.milestones is list
+        && data.milestones.size() <= 20;
+    }
+
+    // Message Validation Blueprint
+    function isValidMessage(data) {
+      return data.keys().hasAll(['projectId', 'senderId', 'senderName', 'message', 'timestamp', 'messageType'])
+        && data.projectId is string && data.projectId.size() <= 128
+        && data.senderId is string && data.senderId.size() <= 128
+        && data.senderName is string && data.senderName.size() <= 256
+        && data.message is string && data.message.size() <= 5000
+        && data.timestamp is timestamp
+        && data.messageType is string && data.messageType.size() <= 20;
+    }
+
+    // Projects Rules Matched Domain
+    match /projects/{projectId} {
+      allow get: if true;
+      allow list: if request.auth == null || (request.auth != null && resource.data.owner_id == request.auth.uid);
+
+      allow create: if isValidId(projectId)
+        && isValidProject(incoming())
+        && isOwnerOrSandbox(incoming().owner_id);
+
+      allow update: if (
+        // Action 1: Owner full sync, preserving identity fields
+        (isOwner(existing()) && isValidProject(incoming()) && incoming().owner_id == existing().owner_id && incoming().id == existing().id && incoming().created_at == existing().created_at) ||
+        // Action 2: Client UPI checkout simulation, changing is_paid to true only. No other data altered.
+        (!existing().is_paid && incoming().is_paid == true && incoming().diff(existing()).affectedKeys().hasOnly(['is_paid']))
+      );
+
+      allow delete: if isOwner(existing());
+    }
+
+    match /clients/{clientId} {
+      allow get: if isOwner(existing());
+      allow list: if request.auth == null || (request.auth != null && resource.data.owner_id == request.auth.uid);
+      allow create: if isOwnerOrSandbox(incoming().owner_id);
+      allow update: if isOwner(existing()) && incoming().owner_id == existing().owner_id;
+      allow delete: if isOwner(existing());
+    }
+
+    match /invoices/{invoiceId} {
+      allow get: if isOwner(existing());
+      allow list: if request.auth == null || (request.auth != null && resource.data.owner_id == request.auth.uid);
+      allow create: if isOwnerOrSandbox(incoming().owner_id);
+      allow update: if isOwner(existing()) && incoming().owner_id == existing().owner_id;
+      allow delete: if isOwner(existing());
+    }
+
+    match /messages/{messageId} {
+      allow get: if true;
+      allow list: if true;
+      allow create: if isValidId(messageId) && isValidMessage(incoming());
+      allow update, delete: if false;
+    }
+  }
+}
